@@ -1,0 +1,8 @@
+# runtime state/log
+serial-bridge/serial-bridge.state.json
+serial-bridge/serial-bridge.health.jsonl
+
+# publish/dist (local)
+dist/
+*.zip
+
