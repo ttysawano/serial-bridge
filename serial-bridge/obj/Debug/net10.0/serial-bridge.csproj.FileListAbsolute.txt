@@ -1,0 +1,14 @@
+/Users/sawano/Documents/serial-bridge-repo/serial-bridge/bin/Debug/net10.0/serial-bridge
+/Users/sawano/Documents/serial-bridge-repo/serial-bridge/bin/Debug/net10.0/serial-bridge.deps.json
+/Users/sawano/Documents/serial-bridge-repo/serial-bridge/bin/Debug/net10.0/serial-bridge.runtimeconfig.json
+/Users/sawano/Documents/serial-bridge-repo/serial-bridge/bin/Debug/net10.0/serial-bridge.dll
+/Users/sawano/Documents/serial-bridge-repo/serial-bridge/bin/Debug/net10.0/serial-bridge.pdb
+/Users/sawano/Documents/serial-bridge-repo/serial-bridge/obj/Debug/net10.0/serial-bridge.GeneratedMSBuildEditorConfig.editorconfig
+/Users/sawano/Documents/serial-bridge-repo/serial-bridge/obj/Debug/net10.0/serial-bridge.AssemblyInfoInputs.cache
+/Users/sawano/Documents/serial-bridge-repo/serial-bridge/obj/Debug/net10.0/serial-bridge.AssemblyInfo.cs
+/Users/sawano/Documents/serial-bridge-repo/serial-bridge/obj/Debug/net10.0/serial-bridge.csproj.CoreCompileInputs.cache
+/Users/sawano/Documents/serial-bridge-repo/serial-bridge/obj/Debug/net10.0/serial-bridge.dll
+/Users/sawano/Documents/serial-bridge-repo/serial-bridge/obj/Debug/net10.0/refint/serial-bridge.dll
+/Users/sawano/Documents/serial-bridge-repo/serial-bridge/obj/Debug/net10.0/serial-bridge.pdb
+/Users/sawano/Documents/serial-bridge-repo/serial-bridge/obj/Debug/net10.0/serial-bridge.genruntimeconfig.cache
+/Users/sawano/Documents/serial-bridge-repo/serial-bridge/obj/Debug/net10.0/ref/serial-bridge.dll

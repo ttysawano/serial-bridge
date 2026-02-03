@@ -1,0 +1,40 @@
+version: 1
+
+tcp:
+  # まずは安全側：Windowsローカルのみで待ち受け
+  bind_host: "127.0.0.1"
+  port: 7000
+  # 将来 0.0.0.0 にする場合、Windows Firewall の許可が出ることがあります
+
+serial:
+  # ここは学生に見せない（デフォルト固定）
+  baud_rate: 115200
+  data_bits: 8
+  parity: "none"       # none|odd|even|mark|space
+  stop_bits: 1         # 1|2
+  handshake: "none"    # none|xonxoff|rtscts|dtrdsr
+  dtr_enable: false
+  rts_enable: false
+
+device_select:
+  # COMが複数あるときのヒント（部分一致）
+  preferred_keywords:
+    - "CP210"
+    - "FTDI"
+    - "CH340"
+    - "USB Serial"
+
+  # “前回つながったデバイス” を指紋で追跡するための状態ファイル
+  state_file: "serial-bridge.state.json"
+
+reconnect:
+  initial_delay_ms: 500
+  max_delay_ms: 10000
+  backoff_factor: 2.0
+
+logging:
+  # 健全性ログだけ（テレメ本文ログはWSL側アプリが担当）
+  health_log: "serial-bridge.health.jsonl"
+  level: "info"   # info|debug
+
+
