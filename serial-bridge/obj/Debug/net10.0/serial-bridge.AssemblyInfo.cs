@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("serial-bridge")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+5c4e1b8db66302574c126171923cc17805605995")]
 [assembly: System.Reflection.AssemblyProductAttribute("serial-bridge")]
 [assembly: System.Reflection.AssemblyTitleAttribute("serial-bridge")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
