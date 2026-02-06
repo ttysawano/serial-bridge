@@ -16,7 +16,7 @@ public sealed class HealthLog : IDisposable
     public HealthLog(string path)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
-        _writer = new StreamWriter(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read))
+        _writer = new StreamWriter(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
         {
             AutoFlush = true
         };
@@ -51,4 +51,3 @@ public sealed class HealthLog : IDisposable
         }
     }
 }
-
