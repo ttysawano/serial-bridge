@@ -1,12 +1,13 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.IO.Ports;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
-using System.IO.Ports;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Text.RegularExpressions;
 
 namespace SerialBridge;
 
@@ -16,18 +17,27 @@ public sealed class BridgeSupervisor
     {
         var baseDir = AppContext.BaseDirectory;
 
-        var (cfg, cfgPath) = AppConfig.LoadOrCreateDefault(baseDir);
+        using var lease = InstanceLease.Acquire(Path.GetFullPath(baseDir));
+        var instanceId = lease.InstanceId;
+
+        var (cfg, cfgPath) = AppConfigFile.LoadOrCreateForInstance(baseDir, instanceId);
 
         var healthPath = Path.Combine(baseDir, cfg.Logging.HealthLog);
         using var log = new HealthLog(healthPath);
 
-        log.Info("startup", new { baseDir, cfgPath, dotnet = Environment.Version.ToString() });
-
-        if (!File.Exists(cfgPath))
+        log.Info("startup", new
         {
-            Console.WriteLine($"Config not found: {cfgPath}");
-            Console.WriteLine("Put serial-bridge.yml (or serial-bridge.yml.example) next to the exe.");
-        }
+            baseDir,
+            cfgPath,
+            instanceId,
+            cfgSection = $"instances.{instanceId}",
+            dotnet = Environment.Version.ToString()
+        });
+
+        Console.WriteLine($"Instance: {instanceId}");
+        Console.WriteLine($"Config section: instances.{instanceId}");
+        Console.WriteLine($"State file: {cfg.DeviceSelect.StateFile}");
+        Console.WriteLine($"Health log: {cfg.Logging.HealthLog}");
 
         var statePath = Path.Combine(baseDir, cfg.DeviceSelect.StateFile);
         var state = DeviceState.Load(statePath);
@@ -35,7 +45,7 @@ public sealed class BridgeSupervisor
         var locator = new DeviceLocator();
 
         // Start TCP listener once.
-        var listener = StartListener(cfg, log);
+        var listener = StartListener(cfg, instanceId, log);
 
         // Main loop: keep serial open even if client disconnects.
         while (true)
@@ -66,7 +76,7 @@ public sealed class BridgeSupervisor
 
                 try
                 {
-                    RunBridgeSession(serial, client, sessionCts.Token, log);
+                    RunBridgeSession(serial, client, sessionCts.Token);
                 }
                 catch (SerialDisconnectedException sdx)
                 {
@@ -92,47 +102,155 @@ public sealed class BridgeSupervisor
         }
     }
 
-    private static TcpListener StartListener(AppConfig cfg, HealthLog log)
+    private static TcpListener StartListener(AppConfig cfg, int instanceId, HealthLog log)
     {
         var ip = IPAddress.Parse(cfg.Tcp.BindHost);
-        var listener = new TcpListener(ip, cfg.Tcp.Port);
-        listener.Start();
-        log.Info("tcp_listening", new { cfg.Tcp.BindHost, cfg.Tcp.Port });
-        Console.WriteLine($"TCP listening: {cfg.Tcp.BindHost}:{cfg.Tcp.Port}");
-        return listener;
+
+        if (cfg.Tcp.Port.HasValue)
+        {
+            var requested = cfg.Tcp.Port.Value;
+            var listener = TryStartListener(ip, requested);
+            if (listener == null)
+            {
+                throw new InvalidOperationException($"Configured TCP port {requested} is already in use on {cfg.Tcp.BindHost}.");
+            }
+
+            log.Info("tcp_listening", new { cfg.Tcp.BindHost, Port = requested, mode = "configured" });
+            Console.WriteLine($"TCP listening: {cfg.Tcp.BindHost}:{requested} (configured)");
+            return listener;
+        }
+
+        var candidate = 7000 + instanceId;
+        for (var port = candidate; port <= 65535; port++)
+        {
+            var listener = TryStartListener(ip, port);
+            if (listener == null) continue;
+
+            cfg.Tcp.Port = port;
+            log.Info("tcp_listening", new { cfg.Tcp.BindHost, Port = port, mode = "auto" });
+            Console.WriteLine($"TCP listening: {cfg.Tcp.BindHost}:{port} (auto)");
+            return listener;
+        }
+
+        throw new InvalidOperationException("No available TCP port found.");
     }
 
-private static SerialPort EnsureSerialConnected(
-    AppConfig cfg,
-    DeviceState state,
-    string statePath,
-    DeviceLocator locator,
-    HealthLog log)
-{
-    var delay = cfg.Reconnect.InitialDelayMs;
-
-    bool announcedLast = false;
-
-    while (true)
+    private static TcpListener? TryStartListener(IPAddress ip, int port)
     {
-        if (!announcedLast && !string.IsNullOrWhiteSpace(state.LastFriendlyName))
+        var listener = new TcpListener(ip, port);
+        try
         {
-            Console.WriteLine($"Previous target: {state.LastFriendlyName}");
-            Console.WriteLine("Searching for the same device...");
-            announcedLast = true;
+            listener.Start();
+            return listener;
         }
-
-        var devices = locator.ListDevices();
-        log.Info("serial_scan", new { count = devices.Count });
-
-        if (devices.Count == 0)
+        catch (SocketException ex) when (IsPortInUseSocketException(ex))
         {
-            Console.WriteLine("No COM ports found. Plug the USB-Serial device and wait...");
-            log.Warn("serial_no_ports");
-            SleepBackoff(cfg, ref delay, log);
-            continue;
+            listener.Stop();
+            return null;
         }
+    }
 
+    private static bool IsPortInUseSocketException(SocketException ex)
+    {
+        return ex.SocketErrorCode == SocketError.AddressAlreadyInUse;
+    }
+
+    private static SerialPort EnsureSerialConnected(
+        AppConfig cfg,
+        DeviceState state,
+        string statePath,
+        DeviceLocator locator,
+        HealthLog log)
+    {
+        var delay = cfg.Reconnect.InitialDelayMs;
+        var announcedLast = false;
+
+        while (true)
+        {
+            if (!announcedLast && !string.IsNullOrWhiteSpace(state.LastFriendlyName))
+            {
+                Console.WriteLine($"Previous target: {state.LastFriendlyName}");
+                Console.WriteLine("Searching for the same device...");
+                announcedLast = true;
+            }
+
+            var devices = locator.ListDevices();
+            var busyStates = ProbeBusyPorts(devices, cfg.Serial);
+
+            log.Info("serial_scan", new { count = devices.Count });
+
+            if (devices.Count == 0)
+            {
+                Console.WriteLine("No COM ports found. Plug the USB-Serial device and wait...");
+                log.Warn("serial_no_ports");
+                SleepBackoff(cfg, ref delay, log);
+                continue;
+            }
+
+            var selected = PickInitialDevice(locator, cfg, state, devices, busyStates, log);
+            if (selected == null)
+            {
+                continue;
+            }
+
+            while (selected != null)
+            {
+                log.Info("serial_selected", new { selected.PortName, selected.FriendlyName, selected.PnpDeviceId });
+
+                try
+                {
+                    var sp = OpenSerial(selected.PortName, cfg.Serial);
+
+                    state.LastPortName = selected.PortName;
+                    state.LastFriendlyName = selected.FriendlyName;
+                    state.LastPnpDeviceId = selected.PnpDeviceId;
+                    state.Save(statePath);
+
+                    Console.WriteLine($"Serial connected: {selected.FriendlyName}");
+                    log.Info("serial_connected", new { selected.PortName });
+
+                    delay = cfg.Reconnect.InitialDelayMs;
+                    return sp;
+                }
+                catch (Exception ex) when (IsLikelyPortInUse(ex))
+                {
+                    log.Warn("serial_open_failed_in_use", new { selected.PortName, ex = ex.ToString() });
+                    Console.WriteLine($"{selected.PortName} appears to be in use. Please choose another port.");
+
+                    var pr = PromptSelect(devices, busyStates);
+                    if (pr.Action == PromptAction.Quit)
+                    {
+                        log.Warn("user_exit");
+                        Environment.Exit(0);
+                    }
+
+                    if (pr.Action == PromptAction.Rescan)
+                    {
+                        selected = null;
+                        break;
+                    }
+
+                    selected = pr.Device;
+                }
+                catch (Exception ex)
+                {
+                    log.Warn("serial_open_failed", new { selected.PortName, ex = ex.ToString() });
+                    Console.WriteLine($"Failed to open {selected.PortName}. Retrying...");
+                    SleepBackoff(cfg, ref delay, log);
+                    selected = null;
+                }
+            }
+        }
+    }
+
+    private static SerialDeviceInfo? PickInitialDevice(
+        DeviceLocator locator,
+        AppConfig cfg,
+        DeviceState state,
+        List<SerialDeviceInfo> devices,
+        IReadOnlyDictionary<string, bool> busyStates,
+        HealthLog log)
+    {
         SerialDeviceInfo? selected = null;
 
         // (A) Best: exact PNP match (survives COM number changes)
@@ -144,147 +262,154 @@ private static SerialPort EnsureSerialConnected(
         // (C) Fallback: keyword match
         selected ??= locator.FindByKeywords(devices, cfg.DeviceSelect.PreferredKeywords);
 
-        // If we found an auto-candidate, offer a short window to change
         if (selected != null)
         {
-            Console.WriteLine($"Found: {selected.FriendlyName}");
+            var status = busyStates.TryGetValue(selected.PortName, out var isBusy) && isBusy ? "in-use?" : "ready";
+
+            Console.WriteLine($"Found: {selected.FriendlyName} [{status}]");
             Console.WriteLine("Auto-connecting. Press 'c' within 3 seconds to change the target...");
 
-            log.Info("auto_candidate", new { selected.PortName, selected.FriendlyName, selected.PnpDeviceId });
+            log.Info("auto_candidate", new
+            {
+                selected.PortName,
+                selected.FriendlyName,
+                selected.PnpDeviceId,
+                likelyBusy = status == "in-use?"
+            });
 
             if (WaitForChangeKey(3000))
             {
                 Console.WriteLine("Switch requested. Showing the port list...");
                 log.Info("user_requested_change");
 
-                // Show selection list
-                var pr = PromptSelect(devices);
+                var pr = PromptSelect(devices, busyStates);
                 if (pr.Action == PromptAction.Quit)
                 {
                     log.Warn("user_exit");
                     Environment.Exit(0);
                 }
+
                 if (pr.Action == PromptAction.Rescan)
                 {
-                    // go back to while loop and rescan
-                    continue;
+                    return null;
                 }
+
                 selected = pr.Device;
             }
+
+            return selected;
         }
 
-        // If still none, force selection
-        if (selected == null)
+        Console.WriteLine("No suitable device was auto-selected. Please choose a port.");
+        var forced = PromptSelect(devices, busyStates);
+
+        if (forced.Action == PromptAction.Quit)
         {
-            Console.WriteLine("No suitable device was auto-selected. Please choose a port.");
-            var pr = PromptSelect(devices);
-
-            if (pr.Action == PromptAction.Quit)
-            {
-                log.Warn("user_exit");
-                Environment.Exit(0);
-            }
-            if (pr.Action == PromptAction.Rescan)
-            {
-                continue;
-            }
-
-            selected = pr.Device;
+            log.Warn("user_exit");
+            Environment.Exit(0);
         }
 
-        // Persist state (candidate that we *intend* to use)
-        state.LastPortName = selected!.PortName;
-        state.LastFriendlyName = selected.FriendlyName;
-        state.LastPnpDeviceId = selected.PnpDeviceId;
-        state.Save(statePath);
+        if (forced.Action == PromptAction.Rescan)
+        {
+            return null;
+        }
 
-        log.Info("serial_selected", new { selected.PortName, selected.FriendlyName, selected.PnpDeviceId });
+        return forced.Device;
+    }
 
+    private static IReadOnlyDictionary<string, bool> ProbeBusyPorts(List<SerialDeviceInfo> devices, SerialConfig cfg)
+    {
+        var results = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var device in devices)
+        {
+            results[device.PortName] = IsLikelyBusy(device.PortName, cfg);
+        }
+
+        return results;
+    }
+
+    private static bool IsLikelyBusy(string portName, SerialConfig cfg)
+    {
         try
         {
-            var sp = OpenSerial(selected.PortName, cfg.Serial, log);
-            Console.WriteLine($"Serial connected: {selected.FriendlyName}");
-            log.Info("serial_connected", new { selected.PortName });
-
-            delay = cfg.Reconnect.InitialDelayMs; // reset backoff
-            return sp;
+            using var probe = OpenSerial(portName, cfg);
+            return false;
         }
-        catch (Exception ex)
+        catch
         {
-            log.Warn("serial_open_failed", new { selected.PortName, ex = ex.ToString() });
-            Console.WriteLine($"Failed to open {selected.PortName}. Retrying...");
-            SleepBackoff(cfg, ref delay, log);
+            return true;
         }
     }
-}
 
-private static bool WaitForChangeKey(int timeoutMs)
-{
-    var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
-    while (DateTime.UtcNow < deadline)
+    private static bool WaitForChangeKey(int timeoutMs)
     {
-        if (Console.KeyAvailable)
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
         {
-            var k = Console.ReadKey(intercept: true);
-            if (k.KeyChar == 'c' || k.KeyChar == 'C') return true;
-            if (k.KeyChar == 'q' || k.KeyChar == 'Q') Environment.Exit(0);
+            if (Console.KeyAvailable)
+            {
+                var k = Console.ReadKey(intercept: true);
+                if (k.KeyChar == 'c' || k.KeyChar == 'C') return true;
+                if (k.KeyChar == 'q' || k.KeyChar == 'Q') Environment.Exit(0);
+            }
+
+            Thread.Sleep(50);
         }
-        Thread.Sleep(50);
+
+        return false;
     }
-    return false;
-}
 
-private static SerialDeviceInfo? FindByNormalizedFriendlyName(
-    System.Collections.Generic.List<SerialDeviceInfo> devices,
-    string? lastFriendlyName)
-{
-    if (string.IsNullOrWhiteSpace(lastFriendlyName)) return null;
-
-    static string Norm(string s) =>
-        Regex.Replace(s, @"\s*\(COM\d+\)\s*$", "", RegexOptions.IgnoreCase).Trim();
-
-    var key = Norm(lastFriendlyName);
-    return devices.FirstOrDefault(d => string.Equals(Norm(d.FriendlyName), key, StringComparison.OrdinalIgnoreCase));
-}
-
-
-
-private enum PromptAction
-{
-    Selected,
-    Rescan,
-    Quit
-}
-
-private sealed record PromptResult(PromptAction Action, SerialDeviceInfo? Device);
-
-private static PromptResult PromptSelect(System.Collections.Generic.List<SerialDeviceInfo> devices)
-{
-    while (true)
+    private static SerialDeviceInfo? FindByNormalizedFriendlyName(
+        List<SerialDeviceInfo> devices,
+        string? lastFriendlyName)
     {
-        Console.WriteLine("Select COM port:");
-        for (int i = 0; i < devices.Count; i++)
-        {
-            Console.WriteLine($"  [{i}] {devices[i].FriendlyName}");
-        }
-        Console.Write("Enter number (or 'r' to rescan, 'q' to quit): ");
-        var s = Console.ReadLine()?.Trim();
+        if (string.IsNullOrWhiteSpace(lastFriendlyName)) return null;
 
-        if (string.Equals(s, "q", StringComparison.OrdinalIgnoreCase))
-            return new PromptResult(PromptAction.Quit, null);
+        static string Norm(string s) =>
+            Regex.Replace(s, @"\s*\(COM\d+\)\s*$", "", RegexOptions.IgnoreCase).Trim();
 
-        if (string.Equals(s, "r", StringComparison.OrdinalIgnoreCase))
-            return new PromptResult(PromptAction.Rescan, null);
-
-        if (int.TryParse(s, out var idx) && idx >= 0 && idx < devices.Count)
-            return new PromptResult(PromptAction.Selected, devices[idx]);
-
-        Console.WriteLine("Invalid input.");
+        var key = Norm(lastFriendlyName);
+        return devices.FirstOrDefault(d => string.Equals(Norm(d.FriendlyName), key, StringComparison.OrdinalIgnoreCase));
     }
-}
-    
 
-    private static SerialPort OpenSerial(string portName, SerialConfig cfg, HealthLog log)
+    private enum PromptAction
+    {
+        Selected,
+        Rescan,
+        Quit
+    }
+
+    private sealed record PromptResult(PromptAction Action, SerialDeviceInfo? Device);
+
+    private static PromptResult PromptSelect(List<SerialDeviceInfo> devices, IReadOnlyDictionary<string, bool> busyStates)
+    {
+        while (true)
+        {
+            Console.WriteLine("Select COM port:");
+            for (int i = 0; i < devices.Count; i++)
+            {
+                var busyTag = busyStates.TryGetValue(devices[i].PortName, out var isBusy) && isBusy ? " [in-use?]" : "";
+                Console.WriteLine($"  [{i}] {devices[i].FriendlyName}{busyTag}");
+            }
+
+            Console.Write("Enter number (or 'r' to rescan, 'q' to quit): ");
+            var s = Console.ReadLine()?.Trim();
+
+            if (string.Equals(s, "q", StringComparison.OrdinalIgnoreCase))
+                return new PromptResult(PromptAction.Quit, null);
+
+            if (string.Equals(s, "r", StringComparison.OrdinalIgnoreCase))
+                return new PromptResult(PromptAction.Rescan, null);
+
+            if (int.TryParse(s, out var idx) && idx >= 0 && idx < devices.Count)
+                return new PromptResult(PromptAction.Selected, devices[idx]);
+
+            Console.WriteLine("Invalid input.");
+        }
+    }
+
+    private static SerialPort OpenSerial(string portName, SerialConfig cfg)
     {
         var parity = cfg.Parity.ToLowerInvariant() switch
         {
@@ -306,7 +431,7 @@ private static PromptResult PromptSelect(System.Collections.Generic.List<SerialD
         {
             "xonxoff" => Handshake.XOnXOff,
             "rtscts" => Handshake.RequestToSend,
-            "dtrdsr" => Handshake.RequestToSendXOnXOff, // closest; usually not used here
+            "dtrdsr" => Handshake.RequestToSendXOnXOff,
             _ => Handshake.None
         };
 
@@ -319,8 +444,6 @@ private static PromptResult PromptSelect(System.Collections.Generic.List<SerialD
             Handshake = handshake,
             DtrEnable = cfg.DtrEnable,
             RtsEnable = cfg.RtsEnable,
-
-            // Important: allow cancel-ish by polling
             ReadTimeout = 500,
             WriteTimeout = 2000
         };
@@ -329,11 +452,20 @@ private static PromptResult PromptSelect(System.Collections.Generic.List<SerialD
         return sp;
     }
 
-    private static void RunBridgeSession(SerialPort serial, TcpClient client, CancellationToken token, HealthLog log)
+    private static bool IsLikelyPortInUse(Exception ex)
+    {
+        return ex switch
+        {
+            UnauthorizedAccessException => true,
+            IOException => true,
+            _ => ex.InnerException != null && IsLikelyPortInUse(ex.InnerException)
+        };
+    }
+
+    private static void RunBridgeSession(SerialPort serial, TcpClient client, CancellationToken token)
     {
         using var ns = client.GetStream();
 
-        // Pump Serial -> TCP (sync read with timeout)
         var t1 = Task.Run(async () =>
         {
             var buf = new byte[8192];
@@ -360,14 +492,14 @@ private static PromptResult PromptSelect(System.Collections.Generic.List<SerialD
             }
         }, token);
 
-        // Pump TCP -> Serial
         var t2 = Task.Run(async () =>
         {
             var buf = new byte[8192];
             while (!token.IsCancellationRequested)
             {
                 int n = await ns.ReadAsync(buf.AsMemory(0, buf.Length), token);
-                if (n == 0) break; // client closed
+                if (n == 0) break;
+
                 try
                 {
                     serial.Write(buf, 0, n);
@@ -383,10 +515,19 @@ private static PromptResult PromptSelect(System.Collections.Generic.List<SerialD
         {
             Task.WaitAny(t1, t2);
         }
-        catch { /* ignore */ }
+        catch
+        {
+            // ignored
+        }
 
-        // best-effort join
-        try { Task.WaitAll(new[] { t1, t2 }, 1500); } catch { /* ignore */ }
+        try
+        {
+            Task.WaitAll(new[] { t1, t2 }, 1500);
+        }
+        catch
+        {
+            // ignored
+        }
     }
 
     private static void SleepBackoff(AppConfig cfg, ref int delayMs, HealthLog log)
@@ -402,4 +543,3 @@ public sealed class SerialDisconnectedException : Exception
 {
     public SerialDisconnectedException(Exception inner) : base("Serial disconnected", inner) { }
 }
-

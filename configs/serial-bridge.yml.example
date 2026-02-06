@@ -1,40 +1,37 @@
-version: 1
+version: 2
 
-tcp:
-  # まずは安全側：Windowsローカルのみで待ち受け
-  bind_host: "127.0.0.1"
-  port: 7000
-  # 将来 0.0.0.0 にする場合、Windows Firewall の許可が出ることがあります
+# 同一exeを複数起動した場合、instances.<番号> を参照します
+# 例: 1つ目の起動は instances.1、2つ目は instances.2
+instances:
+  "1":
+    tcp:
+      bind_host: "127.0.0.1"
+      # port を省略すると、instance=1 の場合 7001 から空きポートを自動探索
+      # port: 7001
 
-serial:
-  # ここは学生に見せない（デフォルト固定）
-  baud_rate: 115200
-  data_bits: 8
-  parity: "none"       # none|odd|even|mark|space
-  stop_bits: 1         # 1|2
-  handshake: "none"    # none|xonxoff|rtscts|dtrdsr
-  dtr_enable: false
-  rts_enable: false
+    serial:
+      baud_rate: 115200
+      data_bits: 8
+      parity: "none"       # none|odd|even|mark|space
+      stop_bits: 1           # 1|2
+      handshake: "none"    # none|xonxoff|rtscts|dtrdsr
+      dtr_enable: false
+      rts_enable: false
 
-device_select:
-  # COMが複数あるときのヒント（部分一致）
-  preferred_keywords:
-    - "CP210"
-    - "FTDI"
-    - "CH340"
-    - "USB Serial"
+    device_select:
+      preferred_keywords:
+        - "CP210"
+        - "FTDI"
+        - "CH340"
+        - "USB Serial"
+      # {instance} を使うと番号展開。未使用時は自動で _1, _2... サフィックス付与
+      state_file: "serial-bridge.state.json"
 
-  # “前回つながったデバイス” を指紋で追跡するための状態ファイル
-  state_file: "serial-bridge.state.json"
+    reconnect:
+      initial_delay_ms: 500
+      max_delay_ms: 10000
+      backoff_factor: 2.0
 
-reconnect:
-  initial_delay_ms: 500
-  max_delay_ms: 10000
-  backoff_factor: 2.0
-
-logging:
-  # 健全性ログだけ（テレメ本文ログはWSL側アプリが担当）
-  health_log: "serial-bridge.health.jsonl"
-  level: "info"   # info|debug
-
-
+    logging:
+      health_log: "serial-bridge.health.jsonl"
+      level: "info"
